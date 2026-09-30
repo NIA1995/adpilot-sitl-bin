@@ -1,8 +1,9 @@
 name: Build macOS SITL
 
 # ArduPilot는 prebuilt macOS SITL 바이너리를 배포하지 않으므로 우리가 직접 빌드한다.
-# arm64(macos-14) + x64(macos-13)로 arducopter/arduplane/ardurover를 빌드해
+# Apple Silicon(arm64, macos-14) 전용으로 copter/plane/rover/sub를 빌드해
 # 'sitl-bin-v1' prerelease 릴리즈에 업로드한다. 앱(main.cjs)이 이 자산을 받아 실행.
+# (Intel x64 Mac은 미지원 — GitHub의 macos-13 러너 배정 불안정 + Intel Mac 단종 흐름)
 #
 # 각 빌드 잡이 릴리즈로 '직접' 업로드한다(actions 아티팩트 저장소 쿼터를 쓰지 않기 위함).
 # 수동 실행: Actions → Build macOS SITL → Run workflow (ardupilot_ref 지정 가능)
@@ -27,10 +28,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-14   # Apple Silicon
+          - os: macos-14   # Apple Silicon (arm64 전용)
             arch: arm64
-          - os: macos-13   # Intel
-            arch: x64
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout ArduPilot
