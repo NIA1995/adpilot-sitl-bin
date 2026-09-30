@@ -1,0 +1,103 @@
+name: Build macOS SITL
+
+# ArduPilot는 prebuilt macOS SITL 바이너리를 배포하지 않으므로 우리가 직접 빌드한다.
+# arm64(macos-14) + x64(macos-13)로 arducopter/arduplane/ardurover를 빌드해
+# 'sitl-bin-v1' prerelease 릴리즈에 업로드한다. 앱(main.cjs)이 이 자산을 받아 실행.
+#
+# 각 빌드 잡이 릴리즈로 '직접' 업로드한다(actions 아티팩트 저장소 쿼터를 쓰지 않기 위함).
+# 수동 실행: Actions → Build macOS SITL → Run workflow (ardupilot_ref 지정 가능)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ardupilot_ref:
+        description: 'ArduPilot git ref (안정 브랜치/태그). 예: Copter-4.5, Copter-4.5.7'
+        required: true
+        default: 'Copter-4.5'
+  push:
+    tags:
+      - 'build-sitl-*'   # 태그 push로도 트리거 (ardupilot_ref는 기본값 사용)
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14   # Apple Silicon
+            arch: arm64
+          - os: macos-13   # Intel
+            arch: x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout ArduPilot
+        uses: actions/checkout@v4
+        with:
+          repository: ArduPilot/ardupilot
+          ref: ${{ inputs.ardupilot_ref || 'Copter-4.5' }}   # 태그 트리거 시 기본값
+          submodules: recursive
+
+      - name: Patch SIM_Plane (지상 크리프 제거 + lock-step off)
+        run: |
+          python3 - <<'EOF'
+          f = 'libraries/SITL/SIM_Plane.cpp'
+          s = open(f).read()
+          # 1) 무장해제 plane이 공회전(10%) 추력으로 지상에서 앞으로 흐르는 문제 제거.
+          #    on_ground + 저스로틀(<0.15)일 때 공회전 추력을 상쇄 → 기존 0.3 마찰이 정지시킴.
+          anchor = "        accel_body.x -= vel_body.x * 0.3f;\n    }\n"
+          assert anchor in s, "SIM_Plane drift anchor not found — ArduPilot 소스 변경됨, 패치 갱신 필요"
+          inject = anchor + ("\n    // ADPilot: cancel idle thrust on ground to stop disarmed creep\n"
+                             "    if (on_ground() && !tailsitter && throttle < 0.15f) {\n"
+                             "        accel_body.x -= thrust / mass;\n"
+                             "    }\n")
+          s = s.replace(anchor, inject, 1)
+          # 2) lock-step 비활성(실시간 모드) → 클라이언트 없이/늦게 붙어도 안정, QGC 등 직접접속 robust.
+          ls = "lock_step_scheduled = true;"
+          assert ls in s, "lock_step anchor not found — 패치 갱신 필요"
+          s = s.replace(ls, "lock_step_scheduled = false;", 1)
+          open(f, 'w').write(s)
+          print("SIM_Plane patched (drift + lock-step off)")
+          EOF
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'   # 3.12+의 distutils 제거 이슈 회피
+
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # empy 4.x는 waf와 호환 안 됨 → 3.3.4 고정
+          python -m pip install empy==3.3.4 pexpect future pymavlink
+
+      - name: Configure & build SITL
+        run: |
+          ./waf configure --board sitl
+          ./waf copter plane rover sub
+
+      - name: Stage binaries (arch suffix)
+        run: |
+          mkdir -p out
+          cp build/sitl/bin/arducopter out/arducopter-${{ matrix.arch }}
+          cp build/sitl/bin/arduplane  out/arduplane-${{ matrix.arch }}
+          cp build/sitl/bin/ardurover  out/ardurover-${{ matrix.arch }}
+          cp build/sitl/bin/ardusub    out/ardusub-${{ matrix.arch }}
+          chmod +x out/*
+
+      - name: Upload binaries to release (no artifact storage)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          # prerelease로 만들어 electron-updater(앱 자동업데이트)가 무시하도록 함.
+          # 두 아키텍처 잡이 동시에 생성 시도 → 먼저 만든 쪽만 성공, 나머지는 '|| true'로 무시.
+          gh release create sitl-bin-v1 --repo "$REPO" --prerelease \
+            --title "SITL binaries (macOS)" \
+            --notes "ArduPilot SITL prebuilt binaries for macOS (arm64/x64). Auto-built by build-sitl-mac.yml; consumed by the app's one-click SITL on macOS." \
+            || true
+          # 자산명이 아키텍처별로 달라 충돌 없음. 재실행 시 --clobber로 덮어씀.
+          for f in out/*; do
+            gh release upload sitl-bin-v1 "$f" --repo "$REPO" --clobber
+          done
